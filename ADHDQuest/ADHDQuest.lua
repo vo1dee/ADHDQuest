@@ -9,6 +9,7 @@
 ADHDQuest_Cache = ADHDQuest_Cache or {}                     -- key -> summary string (grown live by companion.py)
 ADHDQuest_Pending = ADHDQuest_Pending or {}                 -- key -> { title, text, id }
 ADHDQuest_StaticSummaries = ADHDQuest_StaticSummaries or {} -- key -> summary string (baked in by pregenerate.py)
+ADHDQuest_Settings = ADHDQuest_Settings or { showingFull = false } -- remembers the last chosen view (summary/full)
 
 -- Build a stable key: prefer the numeric quest ID when the client exposes one,
 -- otherwise fall back to a title+text fingerprint (needed on older/private-server
@@ -32,7 +33,7 @@ toggleBtn:SetSize(120, 20)
 toggleBtn:SetText("Show full text")
 toggleBtn:Hide()
 
-local showingFull, currentSummary, currentFull = false, "", ""
+local showingFull, currentSummary, currentFull = ADHDQuest_Settings.showingFull, "", ""
 
 local function Refresh()
     local widget = _G["QuestInfoDescriptionText"]
@@ -46,12 +47,12 @@ end
 
 toggleBtn:SetScript("OnClick", function()
     showingFull = not showingFull
+    ADHDQuest_Settings.showingFull = showingFull
     Refresh()
 end)
 
 local function ShowInPlace(summary, fullText)
     currentSummary, currentFull = summary, fullText
-    showingFull = false
     Refresh()
 end
 
