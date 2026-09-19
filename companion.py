@@ -30,6 +30,10 @@ from pathlib import Path
 import requests
 from slpp import slpp as lua
 
+from envfile import load_dotenv
+
+load_dotenv()  # keys can live in a gitignored .env next to this script
+
 # ---- CONFIGURE THESE ----
 SAVED_VARS_PATH = Path(r"F:\Battle.net\World of Warcraft\_retail_\WTF\Account\134305248#3\SavedVariables\ADHDQuest.lua")
 CACHE_JSON_PATH = Path("adhd_quest_cache.json")  # durable local cache, survives addon reinstalls

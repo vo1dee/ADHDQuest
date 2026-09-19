@@ -18,6 +18,7 @@ Setup:
     Create a client at https://develop.battle.net (free) -> client ID/secret
     export BNET_CLIENT_ID=...
     export BNET_CLIENT_SECRET=...
+    (or copy .env.example to .env and fill it in -- loaded automatically)
     Sign up at openrouter.ai, create a key, add ~$5 in credits (Settings ->
     Credits — Qwen3 32B isn't on the free tier, but this whole bulk run
     only costs a few dollars total, see note below)
@@ -40,9 +41,14 @@ import argparse
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
+
+from envfile import load_dotenv
+
+load_dotenv()  # keys can live in a gitignored .env next to this script
 
 CACHE_JSON_PATH = Path("adhd_quest_cache.json")
 STATIC_LUA_PATH = Path("Summaries.lua")  # ships inside the addon folder
@@ -83,14 +89,18 @@ def get_bnet_token(region: str) -> str:
 
 
 def fetch_quest(region: str, namespace: str, token: str, quest_id: int) -> dict | None:
-    resp = requests.get(
-        f"https://{region}.api.blizzard.com/data/wow/quest/{quest_id}",
-        params={"namespace": namespace, "locale": "en_US"},
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    if resp.status_code != 200:
-        return None
-    return resp.json()
+    for _ in range(5):
+        resp = requests.get(
+            f"https://{region}.api.blizzard.com/data/wow/quest/{quest_id}",
+            params={"namespace": namespace, "locale": "en_US"},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30,
+        )
+        if resp.status_code == 429:  # Blizzard's per-second / hourly quota
+            time.sleep(int(resp.headers.get("Retry-After", 2)))
+            continue
+        return resp.json() if resp.status_code == 200 else None
+    return None
 
 
 def summarize(title: str, text: str) -> str:
@@ -142,39 +152,46 @@ def write_static_lua(cache: dict) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--start", type=int, required=True)
+    ap.add_argument("--start", type=int, help="default: highest cached quest ID + 1")
     ap.add_argument("--end", type=int, required=True)
     ap.add_argument("--region", default="us")
     ap.add_argument("--namespace", default="static-us")
+    ap.add_argument("--workers", type=int, default=8, help="concurrent Blizzard API fetches")
     args = ap.parse_args()
 
     cache = json.loads(CACHE_JSON_PATH.read_text(encoding="utf-8")) if CACHE_JSON_PATH.exists() else {}
+    if args.start is None:
+        args.start = max((int(k[3:]) for k in cache if k.startswith("id:")), default=0) + 1
+    print(f"Scanning quest IDs {args.start}-{args.end} ({len(cache)} already cached).")
     token = get_bnet_token(args.region)
     hits, misses, failures = 0, 0, 0
 
-    for qid in range(args.start, args.end + 1):
-        key = f"id:{qid}"
-        if key in cache:
-            continue
-        data = fetch_quest(args.region, args.namespace, token, qid)
-        text = (data or {}).get("description", "")
-        if not text:
-            misses += 1
-            continue
-        title = data.get("title", "")
-        try:
-            cache[key] = summarize(title, text)
-        except Exception as e:
-            failures += 1
-            print(f"{qid}: {title!r} -- FAILED, skipping ({e})")
-            continue  # not cached, so a future run will retry it automatically
-        hits += 1
-        print(f"{qid}: {title!r} -> {cache[key]}")
-        if hits % 50 == 0:
-            CACHE_JSON_PATH.write_text(json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8")
-        time.sleep(0.1)  # be polite to Blizzard's API
-
-    CACHE_JSON_PATH.write_text(json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8")
+    todo = [q for q in range(args.start, args.end + 1) if f"id:{q}" not in cache]
+    save = lambda: CACHE_JSON_PATH.write_text(json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8")
+    fetch = lambda q: fetch_quest(args.region, args.namespace, token, q)
+    try:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            # map() yields in ID order; fetches run ahead concurrently, summaries stay sequential
+            for qid, data in zip(todo, pool.map(fetch, todo)):
+                text = (data or {}).get("description", "")
+                if not text:
+                    misses += 1
+                    continue
+                title = data.get("title", "")
+                try:
+                    cache[f"id:{qid}"] = summarize(title, text)
+                except Exception as e:
+                    failures += 1
+                    print(f"{qid}: {title!r} -- FAILED, skipping ({e})")
+                    continue  # not cached, so a future run will retry it automatically
+                hits += 1
+                print(f"{qid}: {title!r} -> {cache[f'id:{qid}']}")
+                if hits % 50 == 0:
+                    save()
+    except KeyboardInterrupt:
+        print("Interrupted -- saving what we have. Re-run to continue (cached IDs are skipped).")
+    finally:
+        save()
     write_static_lua(cache)
     print(f"Done. {hits} new summaries, {misses} quest IDs had no description, "
           f"{failures} failed and will retry next run. {len(cache)} total cached.")
