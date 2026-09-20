@@ -30,6 +30,10 @@ end
 
 local toggleBtn = CreateFrame("Button", "ADHDQuestToggleBtn", QuestFrame, "UIPanelButtonTemplate")
 toggleBtn:SetSize(120, 20)
+-- Parked in the empty header strip under the title bar: anything anchored to the
+-- description text lands on top of the next section, since that layout is Blizzard's.
+toggleBtn:SetPoint("TOPRIGHT", QuestFrame, "TOPRIGHT", -40, -40)
+toggleBtn:SetFrameLevel(QuestFrame:GetFrameLevel() + 10)
 toggleBtn:SetText("Show full text")
 toggleBtn:Hide()
 
@@ -40,8 +44,6 @@ local function Refresh()
     if not widget then return end
     widget:SetText(showingFull and currentFull or currentSummary)
     toggleBtn:SetText(showingFull and "Show summary" or "Show full text")
-    toggleBtn:ClearAllPoints()
-    toggleBtn:SetPoint("TOPLEFT", widget, "BOTTOMLEFT", 0, -6)
     toggleBtn:Show()
 end
 

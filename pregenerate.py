@@ -40,6 +40,7 @@ Usage:
 import argparse
 import json
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -51,7 +52,8 @@ from envfile import load_dotenv
 load_dotenv()  # keys can live in a gitignored .env next to this script
 
 CACHE_JSON_PATH = Path("adhd_quest_cache.json")
-STATIC_LUA_PATH = Path("Summaries.lua")  # ships inside the addon folder
+FAILED_JSON_PATH = Path("failed_ids.json")  # IDs that errored; retried first on the next run
+STATIC_LUA_PATH = Path("ADHDQuest/Summaries.lua")  # ships inside the addon folder
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "qwen/qwen3-32b")
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -88,19 +90,56 @@ def get_bnet_token(region: str) -> str:
     return resp.json()["access_token"]
 
 
-def fetch_quest(region: str, namespace: str, token: str, quest_id: int) -> dict | None:
-    for _ in range(5):
-        resp = requests.get(
-            f"https://{region}.api.blizzard.com/data/wow/quest/{quest_id}",
-            params={"namespace": namespace, "locale": "en_US"},
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=30,
-        )
-        if resp.status_code == 429:  # Blizzard's per-second / hourly quota
-            time.sleep(int(resp.headers.get("Retry-After", 2)))
+class FatalError(Exception):
+    """Errors retrying can't fix (out of credits, bad key) -- stop the run instead of failing every ID."""
+
+
+class BnetToken:
+    """Shared across worker threads; refreshes once when Blizzard says the token expired (24h life)."""
+
+    def __init__(self, region: str):
+        self.region, self.value, self.lock = region, get_bnet_token(region), threading.Lock()
+
+    def refresh(self, stale: str) -> None:
+        with self.lock:
+            if self.value == stale:  # another thread may have refreshed already
+                self.value = get_bnet_token(self.region)
+
+
+def fetch_quest(region: str, namespace: str, token: BnetToken, quest_id: int) -> dict | None:
+    """Returns the quest, or None if Blizzard has no such quest (404). Retries transient
+    failures (timeouts, 429, 5xx); raises if it still can't get a definite answer, so a
+    flaky request is never mistaken for a missing quest."""
+    last = None
+    for attempt in range(6):
+        sent = token.value
+        try:
+            resp = requests.get(
+                f"https://{region}.api.blizzard.com/data/wow/quest/{quest_id}",
+                params={"namespace": namespace, "locale": "en_US"},
+                headers={"Authorization": f"Bearer {sent}"},
+                timeout=30,
+            )
+        except requests.exceptions.RequestException as e:  # timeouts, resets, DNS blips
+            last = e
+            time.sleep(2 ** attempt)
             continue
-        return resp.json() if resp.status_code == 200 else None
-    return None
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code == 404:
+            return None
+        if resp.status_code == 401:
+            token.refresh(sent)
+            last = RuntimeError("HTTP 401")
+        elif resp.status_code == 429:  # Blizzard's per-second / hourly quota
+            time.sleep(int(resp.headers.get("Retry-After", 2)))
+            last = RuntimeError("HTTP 429")
+        elif resp.status_code >= 500:
+            time.sleep(2 ** attempt)
+            last = RuntimeError(f"HTTP {resp.status_code}")
+        else:
+            raise RuntimeError(f"Blizzard API HTTP {resp.status_code}: {resp.text[:200]}")
+    raise RuntimeError(f"Blizzard API gave up after retries ({last})")
 
 
 def summarize(title: str, text: str) -> str:
@@ -123,18 +162,20 @@ def summarize(title: str, text: str) -> str:
                     {"role": "user", "content": f"Quest title: {title}\n\nQuest text:\n{text}"},
                 ],
             },
-            timeout=30,
+            timeout=60,
         )
         if resp.status_code == 429:
             print("Rate limited, waiting 30s before retrying...")
             time.sleep(30)
             continue
+        if resp.status_code in (401, 402, 403):
+            raise FatalError(f"OpenRouter HTTP {resp.status_code} ({'out of credits' if resp.status_code == 402 else 'bad key'}): {resp.text[:200]}")
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"].get("content")
-        if not content:
-            raise RuntimeError(f"Model returned empty content (raw response: {resp.json()})")
+        if not content:  # Qwen sometimes spends the whole budget on hidden reasoning; a retry usually works
+            continue
         return content.strip()
-    raise RuntimeError("Gave up after repeated rate limiting")
+    raise RuntimeError("Gave up: rate limited or empty responses on every attempt")
 
 
 def lua_escape(s: str) -> str:
@@ -156,46 +197,75 @@ def main() -> None:
     ap.add_argument("--end", type=int, required=True)
     ap.add_argument("--region", default="us")
     ap.add_argument("--namespace", default="static-us")
-    ap.add_argument("--workers", type=int, default=8, help="concurrent Blizzard API fetches")
+    ap.add_argument("--workers", type=int, default=16, help="concurrent fetch+summarize workers")
     args = ap.parse_args()
 
     cache = json.loads(CACHE_JSON_PATH.read_text(encoding="utf-8")) if CACHE_JSON_PATH.exists() else {}
     if args.start is None:
         args.start = max((int(k[3:]) for k in cache if k.startswith("id:")), default=0) + 1
     print(f"Scanning quest IDs {args.start}-{args.end} ({len(cache)} already cached).")
-    token = get_bnet_token(args.region)
+    token = BnetToken(args.region)
     hits, misses, failures = 0, 0, 0
 
-    todo = [q for q in range(args.start, args.end + 1) if f"id:{q}" not in cache]
-    save = lambda: CACHE_JSON_PATH.write_text(json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8")
-    fetch = lambda q: fetch_quest(args.region, args.namespace, token, q)
+    failed = set(json.loads(FAILED_JSON_PATH.read_text())) if FAILED_JSON_PATH.exists() else set()
+    todo = sorted(q for q in {*range(args.start, args.end + 1), *failed} if f"id:{q}" not in cache)
+    if failed:
+        print(f"Also retrying {len(failed)} IDs that failed last time.")
+    def save() -> None:
+        CACHE_JSON_PATH.write_text(json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8")
+        FAILED_JSON_PATH.write_text(json.dumps(sorted(failed)), encoding="utf-8")
+
+    consecutive_errors = 0
+
+    def work(qid: int):
+        """Runs in a worker thread: fetch, then summarize. Returns (qid, title, summary, error)."""
+        title = ""
+        try:
+            data = fetch_quest(args.region, args.namespace, token, qid)
+            text = (data or {}).get("description", "")
+            if not text:
+                return qid, "", None, None
+            title = data.get("title", "")
+            return qid, title, summarize(title, text), None
+        except Exception as e:  # one bad quest must never kill a multi-hour run
+            return qid, title, None, e
+
+    pool = ThreadPoolExecutor(max_workers=args.workers)
     try:
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            # map() yields in ID order; fetches run ahead concurrently, summaries stay sequential
-            for qid, data in zip(todo, pool.map(fetch, todo)):
-                text = (data or {}).get("description", "")
-                if not text:
-                    misses += 1
-                    continue
-                title = data.get("title", "")
-                try:
-                    cache[f"id:{qid}"] = summarize(title, text)
-                except Exception as e:
-                    failures += 1
-                    print(f"{qid}: {title!r} -- FAILED, skipping ({e})")
-                    continue  # not cached, so a future run will retry it automatically
-                hits += 1
-                print(f"{qid}: {title!r} -> {cache[f'id:{qid}']}")
-                if hits % 50 == 0:
-                    save()
+        # map() yields in ID order while the workers run ahead concurrently
+        for qid, title, summary, error in pool.map(work, todo):
+            if isinstance(error, FatalError):
+                print(f"{qid}: STOPPING -- {error}\nFix that (top up credits / check the key) and re-run; progress is saved.")
+                failed.add(qid)
+                break
+            if error:
+                failures += 1
+                failed.add(qid)  # remembered in failed_ids.json, retried on the next run
+                consecutive_errors += 1
+                print(f"{qid}: {title!r} -- FAILED, skipping ({error})")
+                if consecutive_errors >= 25:
+                    print("STOPPING -- 25 failures in a row (network down?). Progress is saved; re-run when fixed.")
+                    break
+                continue
+            consecutive_errors = 0
+            failed.discard(qid)
+            if summary is None:
+                misses += 1
+                continue
+            cache[f"id:{qid}"] = summary
+            hits += 1
+            print(f"{qid}: {title!r} -> {summary}")
+            if hits % 50 == 0:
+                save()
     except KeyboardInterrupt:
         print("Interrupted -- saving what we have. Re-run to continue (cached IDs are skipped).")
     finally:
+        pool.shutdown(wait=False, cancel_futures=True)  # don't run the whole queue after Ctrl-C
         save()
     write_static_lua(cache)
     print(f"Done. {hits} new summaries, {misses} quest IDs had no description, "
           f"{failures} failed and will retry next run. {len(cache)} total cached.")
-    print(f"Copy {STATIC_LUA_PATH} into the ADHDQuest addon folder and add it to the .toc.")
+    print(f"Copy the ADHDQuest folder into your WoW AddOns directory (Summaries.lua is already in the .toc).")
 
 
 if __name__ == "__main__":
