@@ -16,6 +16,25 @@ FOREIGN = set("le la les des est une du pour avec der die das und ist nicht el l
               "il di che è per non и в на не что".split())
 
 
+JUNK = re.compile(r"^\W*(?:no quest|no summary|quest details|tbd)|no quest (?:text|details)|insufficient input"
+                  r"|is a placeholder|are placeholders|not yet implemented|no implemented text", re.I)
+BRACKET_TOKEN = re.compile(r"\[[A-Za-z]{1,10}\]")  # model-invented stand-ins like [Name], [NPC], [class]
+
+
+def hard_problems(text: str) -> list[str]:
+    """Defects that make a summary unusable; pregenerate.py retries these instead of caching them."""
+    found = []
+    if {unicodedata.name(c, "?").split()[0] for c in text if c.isalpha()} - {"LATIN"}:
+        found.append("non-Latin script")
+    if len(text.strip()) < 25 or not re.search(r"[.!?\"'’”)]$", text.strip()):
+        found.append("too short / truncated")
+    if JUNK.search(text):
+        found.append("no-content junk")
+    if BRACKET_TOKEN.search(text):
+        found.append("bracket token")
+    return found
+
+
 def problems(text: str) -> list[str]:
     found = []
     if not text.strip():
@@ -31,7 +50,8 @@ def problems(text: str) -> list[str]:
     if len(words) < 8 or sum(w in ENGLISH for w in words) / len(words) < 0.15:
         found.append("too short / few English words")
     if re.search(r"\{\w+\}", text):
-        found.append("unfilled {placeholder}")
+        found.append("unfilled {placeholder}")  # fine: the addon fills {name}/{class}/{race} at runtime
+    found += [h for h in hard_problems(text) if h not in found and not h.startswith("non-Latin")]
     return found
 
 

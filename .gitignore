@@ -15,3 +15,6 @@ Thumbs.db
 # Never commit real credentials if you ever end up putting them in a file
 .env
 *.env
+
+# pregenerate.py retry queue (local state)
+failed_ids.json

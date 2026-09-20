@@ -2,7 +2,7 @@
 ## Title: ADHDQuest
 ## Notes: Shows a short, AI-generated version of quest text.
 ## Author: vo1dee
-## Version: 0.1
+## Version: 0.2
 ## SavedVariables: ADHDQuest_Cache, ADHDQuest_Pending, ADHDQuest_Settings
 
 Summaries.lua

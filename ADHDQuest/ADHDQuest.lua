@@ -22,6 +22,21 @@ local function MakeKey(id, title, text)
     return "txt:" .. (title or "") .. "|" .. snippet
 end
 
+-- Summaries can contain WoW's own {name}/{class}/{race} tokens (carried over from the
+-- quest text); fill them in for the current character. Unknown tokens are left as-is.
+local function FillTokens(summary)
+    return (summary:gsub("{(%a+)}", function(token)
+        local kind = token:lower()
+        local value
+        if kind == "name" then value = UnitName("player")
+        elseif kind == "class" then value = UnitClass("player")
+        elseif kind == "race" then value = UnitRace("player") end
+        if not value then return nil end
+        if kind ~= "name" and token:find("^%l") then value = value:lower() end -- "a mage", not "a Mage"
+        return value
+    end))
+end
+
 ----------------------------------------------------------------------
 -- In-place display: overwrites QuestInfoDescriptionText (the flavor-text
 -- widget Blizzard reuses across the detail/progress/reward quest pages)
@@ -68,6 +83,7 @@ local function Capture(text, questTitle, id)
 
     local summary = ADHDQuest_Cache[key] or ADHDQuest_StaticSummaries[key]
     if summary then
+        summary = FillTokens(summary)
         local widget = _G["QuestInfoDescriptionText"]
         if widget then
             ShowInPlace(summary, text)

@@ -47,6 +47,7 @@ from pathlib import Path
 
 import requests
 
+from check_english import hard_problems
 from envfile import load_dotenv
 
 load_dotenv()  # keys can live in a gitignored .env next to this script
@@ -76,6 +77,7 @@ Style: casual and direct, like a friend paraphrasing what an NPC just said.
 Third person, no stage directions, no quotation marks, no exclamation-point
 marketing tone. Never invent facts that aren't in the source text.
 
+Write in English only, using only Latin letters -- never mix in other languages.
 Output ONLY the summary. No preamble, no "Summary:", no extra formatting.
 """
 
@@ -174,8 +176,11 @@ def summarize(title: str, text: str) -> str:
         content = resp.json()["choices"][0]["message"].get("content")
         if not content:  # Qwen sometimes spends the whole budget on hidden reasoning; a retry usually works
             continue
-        return content.strip()
-    raise RuntimeError("Gave up: rate limited or empty responses on every attempt")
+        content = content.replace("[DNT]", "").strip()  # "do not translate" marker from item names like TK02[DNT]
+        if hard_problems(content):  # Chinese mixed in, cut off mid-sentence, "no quest text", [Name] tokens...
+            continue
+        return content
+    raise RuntimeError("Gave up: rate limited, or empty/unusable responses on every attempt")
 
 
 def lua_escape(s: str) -> str:
